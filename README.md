@@ -26,53 +26,57 @@ An enterprise-grade, end-to-end real-time data engineering platform simulating a
 High-concurrency mobility platforms process millions of transaction events every minute—dispatches, real-time GPS telemetry, surge calculations, and fare reconciliations. Operating teams need sub-minute analytical visibility without compromising data consistency or blowing cloud compute budgets.
 
 ### Core Problems Solved:
-1. **Unifying Streaming Events with Massive Historical Backfills:**
-   * *Problem:* Ingesting live firehose transactions while reconciling 2,000+ historical batch records (`bulk_rides`) often introduces duplicate records or requires expensive repeated full-table overwrites.
-   * *Solution:* Leveraged Databricks Spark Declarative Pipelines (SDP / Lakeflow) with `@dp.append_flow`. The historical backfill runs once (`once=True`), while streaming transactions append continuously (`once=False`), ensuring strictly idempotent, exactly-once processing.
 
-2. **Eliminating Pipeline Maintenance Debt via Metadata-Driven Ingestion:**
-   * *Problem:* Hardcoding schemas for 7+ reference dimension lookups across pipelines creates brittle code that breaks whenever upstream schema attributes change.
-   * *Solution:* Developed two levels of dynamic automation:
-     * **Azure Data Factory:** A single parameterized pipeline iterates over a dynamic configuration array (`files_array.json`), automating HTTP-to-ADLS Gen2 copy activities without manual pipeline duplication.
-     * **Jinja2 SQL Compilation Engine:** Dynamically generates complex multi-table joins for the Silver One Big Table (OBT) from a Python configuration dictionary, reducing schema evolution maintenance to zero-code configuration edits.
+* **Unifying Streaming Events with Massive Historical Backfills:**
+  * Ingesting live firehose transactions while reconciling 2,000+ historical batch records (`bulk_rides`) often introduces duplicate records or requires expensive repeated full-table overwrites.
+  * *Solution:* Leveraged Databricks Spark Declarative Pipelines (SDP / Lakeflow) with `@dp.append_flow`. The historical backfill runs once (`once=True`), while streaming transactions append continuously (`once=False`), ensuring strictly idempotent, exactly-once processing.
 
-3. **Bounding State Memory on Real-Time Joins:**
-   * *Problem:* Joining continuous transaction streams with static dimensions can cause memory state explosion if late-arriving events are not bounded.
-   * *Solution:* Applied an explicit 3-minute watermark (`WATERMARK booking_timestamp DELAY OF INTERVAL 3 MINUTES`) to drop stale states outside the processing window, safeguarding cluster stability.
+* **Eliminating Pipeline Maintenance Debt via Metadata-Driven Ingestion:**
+  * Hardcoding schemas for 7+ reference dimension lookups across pipelines creates brittle code that breaks whenever upstream schema attributes change.
+  * *Solution:* Developed two levels of dynamic automation:
+    * **Azure Data Factory:** A single parameterized pipeline iterates over a dynamic configuration array (`files_array.json`), automating HTTP-to-ADLS Gen2 copy activities without manual pipeline duplication.
+    * **Jinja2 SQL Compilation Engine:** Dynamically generates complex multi-table joins for the Silver One Big Table (OBT) from a Python configuration dictionary, reducing schema evolution maintenance to zero-code configuration edits.
 
-4. **Tracking Historical Attribute Drift (SCD Type 2):**
-   * *Problem:* Reference dimensions (e.g., city territory reallocations) change over time. Overwriting values corrupts historical reporting, while standard tracking requires hundreds of lines of complex merge scripts.
-   * *Solution:* Implemented `dp.create_auto_cdc_flow` to automatically manage `__START_AT` and `__END_AT` audit intervals on `Dim_location`, while enforcing strict active-record filters (`__END_AT IS NULL`) on fact table joins to prevent Cartesian fan-out.
+* **Bounding State Memory on Real-Time Joins:**
+  * Joining continuous transaction streams with static dimensions can cause memory state explosion if late-arriving events are not bounded.
+  * *Solution:* Applied an explicit 3-minute watermark (`WATERMARK booking_timestamp DELAY OF INTERVAL 3 MINUTES`) to drop stale states outside the processing window, safeguarding cluster stability.
+
+* **Tracking Historical Attribute Drift (SCD Type 2):**
+  * Reference dimensions (e.g., city territory reallocations) change over time. Overwriting values corrupts historical reporting, while standard tracking requires hundreds of lines of complex merge scripts.
+  * *Solution:* Implemented `dp.create_auto_cdc_flow` to automatically manage `__START_AT` and `__END_AT` audit intervals on `Dim_location`, while enforcing strict active-record filters (`__END_AT IS NULL`) on fact table joins to prevent Cartesian fan-out.
 
 ---
 
 ## Medallion Architecture Breakdown
 
+```text
 [ FastAPI Booking App ] ───> [ Azure Event Hubs (Kafka) ] ───> [ uber.bronze.rides_raw ]
-│
+                                                                        │
 [ GitHub / HTTP Lookups ] ──> [ Azure Data Factory ] ───────> [ uber.bronze.map_* ]
-│
-▼
-[ uber.bronze.stg_rides ]
-(Append Flow: Bulk + Stream)
-│
-(3-Min Watermark Join)
-(Jinja2 OBT Engine)
-▼
-[ uber.silver.silver_obt ]
-│
-(dp.create_auto_cdc)
-▼
-═════════════════════════════════
-GOLD LAYER (Star Schema)
-═════════════════════════════════
-• uber.gold.fact (Central Fact)
-• uber.gold.Dim_location (SCD 2)
-• uber.gold.Dim_passenger (SCD 1)
-• uber.gold.Dim_driver (SCD 1)
-• uber.gold.Dim_vehicle (SCD 1)
-• uber.gold.Dim_payments (SCD 1)
-• uber.gold.Dim_booking (SCD 1)
+                                                                        │
+                                                                        ▼
+                                                          [ uber.bronze.stg_rides ]
+                                                          (Append Flow: Bulk + Stream)
+                                                                        │
+                                                              (3-Min Watermark Join)
+                                                              (Jinja2 OBT Engine)
+                                                                        ▼
+                                                          [ uber.silver.silver_obt ]
+                                                                        │
+                                                               (dp.create_auto_cdc)
+                                                                        ▼
+                                                      ═════════════════════════════════
+                                                          GOLD LAYER (Star Schema)
+                                                      ═════════════════════════════════
+                                                      • uber.gold.fact (Central Fact)
+                                                      • uber.gold.Dim_location (SCD 2)
+                                                      • uber.gold.Dim_passenger (SCD 1)
+                                                      • uber.gold.Dim_driver (SCD 1)
+                                                      • uber.gold.Dim_vehicle (SCD 1)
+                                                      • uber.gold.Dim_payments (SCD 1)
+                                                      • uber.gold.Dim_booking (SCD 1)
+```
+
 ---
 
 ## Detailed Pipeline Implementation
@@ -89,13 +93,19 @@ GOLD LAYER (Star Schema)
 
 ### 3. Silver Layer: Dynamic OBT & Stateful Streaming Joins (`Databricks/.../silver/`)
 * **Jinja2 SQL Templating Engine:** Automatically constructs the multi-table join SQL. Instead of hardcoded statements, dimension additions are maintained in a configuration dictionary:
-  ```python
-  {
-      "table": "uber.bronze.map_vehicle_types",
-      "select": "map_vehicle_types.vehicle_type, map_vehicle_types.base_rate, map_vehicle_types.per_mile",
-      "on": "stg_rides.vehicle_type_id = map_vehicle_types.vehicle_type_id"
-  }
-Watermarked Stream-Static Join (Silver_OBT.sql): Combines the live transaction stream with all reference tables to produce the consolidated One Big Table (uber.silver.silver_obt):SQLCREATE OR REFRESH STREAMING TABLE uber.silver.silver_obt AS
+
+```python
+{
+    "table": "uber.bronze.map_vehicle_types",
+    "select": "map_vehicle_types.vehicle_type, map_vehicle_types.base_rate, map_vehicle_types.per_mile",
+    "on": "stg_rides.vehicle_type_id = map_vehicle_types.vehicle_type_id"
+}
+```
+
+* **Watermarked Stream-Static Join (`Silver_OBT.sql`):** Combines the live transaction stream with all reference tables to produce the consolidated One Big Table (`uber.silver.silver_obt`):
+
+```sql
+CREATE OR REFRESH STREAMING TABLE uber.silver.silver_obt AS
 SELECT 
     stg_rides.*,
     map_cities.city AS pickup_city,
@@ -107,10 +117,32 @@ SELECT
     map_payment_methods.payment_method
 FROM stream(uber.bronze.stg_rides)
 WATERMARK booking_timestamp DELAY OF INTERVAL 3 MINUTES stg_rides
-LEFT JOIN uber.bronze.map_cities ON stg_rides.pickup_city_id = map_cities.city_id
-LEFT JOIN uber.bronze.map_vehicle_types ON stg_rides.vehicle_type_id = map_vehicle_types.vehicle_type_id
-...
-4. Gold Layer: Star Schema & Automated CDC (Databricks/.../gold/model.py)Materializes a normalized Dimensional Model partitioned into 6 dimensions and a central Fact table:TableModeling StrategyPrimary KeySequencing ColumnPurposeDim_passengerSCD Type 1passenger_idpassenger_idPassenger profiles and contact informationDim_driverSCD Type 1driver_iddriver_idDriver credentials, ratings, and licensingDim_vehicleSCD Type 1vehicle_idvehicle_idVehicle specifications, models, and classesDim_paymentsSCD Type 1payment_method_idpayment_method_idPayment gateway configurations and auth flagsDim_bookingSCD Type 1ride_idride_idMaster booking context and routing endpointsDim_locationSCD Type 2pickup_city_idcity_updated_atTracks municipal boundary and regional updatesfactTransaction FactComposite Keysride_idCore numeric metrics (fares, distance, tip, surge)Analytical Verification Queries1. Active Dimensional Star Schema QuerySQLSELECT 
+LEFT JOIN uber.bronze.map_cities 
+    ON stg_rides.pickup_city_id = map_cities.city_id
+LEFT JOIN uber.bronze.map_vehicle_types 
+    ON stg_rides.vehicle_type_id = map_vehicle_types.vehicle_type_id
+```
+
+### 4. Gold Layer: Star Schema & Automated CDC (`Databricks/.../gold/model.py`)
+Materializes a normalized Dimensional Model partitioned into 6 dimensions and a central Fact table:
+
+| Table | Modeling Strategy | Primary Key | Sequencing Column | Purpose |
+| :--- | :--- | :--- | :--- | :--- |
+| `Dim_passenger` | SCD Type 1 | `passenger_id` | `passenger_id` | Passenger profiles and contact information |
+| `Dim_driver` | SCD Type 1 | `driver_id` | `driver_id` | Driver credentials, ratings, and licensing |
+| `Dim_vehicle` | SCD Type 1 | `vehicle_id` | `vehicle_id` | Vehicle specifications, models, and classes |
+| `Dim_payments` | SCD Type 1 | `payment_method_id` | `payment_method_id` | Payment gateway configurations and auth flags |
+| `Dim_booking` | SCD Type 1 | `ride_id` | `ride_id` | Master booking context and routing endpoints |
+| `Dim_location` | SCD Type 2 | `pickup_city_id` | `city_updated_at` | Tracks municipal boundary and regional updates |
+| `fact` | Transaction Fact | Composite Keys | `ride_id` | Core numeric metrics (fares, distance, tip, surge) |
+
+---
+
+## Analytical Verification Queries
+
+### 1. Active Dimensional Star Schema Query
+```sql
+SELECT 
     f.ride_id,
     p.passenger_name,
     d.driver_name,
@@ -131,7 +163,11 @@ LEFT JOIN uber.gold.Dim_location loc
     ON f.pickup_city_id = loc.pickup_city_id 
     AND loc.__END_AT IS NULL   -- Guardrail: Filters out expired historical records
 LIMIT 10;
-2. Auditing SCD Type 2 Historical ChangesSQLSELECT 
+```
+
+### 2. Auditing SCD Type 2 Historical Changes
+```sql
+SELECT 
     pickup_city_id,
     pickup_city,
     city_updated_at,
@@ -140,5 +176,80 @@ LIMIT 10;
 FROM uber.gold.Dim_location
 WHERE pickup_city_id = 2
 ORDER BY __START_AT ASC;
-Tech Stack SummaryEvent Broker: Azure Event Hubs (Standard Tier, Kafka Protocol)Storage Layer: Azure Data Lake Storage Gen2 (Hierarchical Namespace) & Delta LakeOrchestration: Azure Data Factory (Dynamic Parameterized Pipelines) & Databricks WorkflowsTransformation & Processing: Apache Spark 3.5+, PySpark Structured Streaming, Spark Declarative Pipelines (Lakeflow / DLT)Data Modeling & Governance: Databricks Unity Catalog, Jinja2 Templating, Auto-CDC (SCD 1 & 2)Producer Simulation: Python, FastAPI, Uvicorn, Jinja2
+```
+
+---
+
+## Repository Structure
+
+```text
+├── App/
+│   ├── api.py                     # FastAPI web application for interactive booking
+│   ├── connection.py              # Event Hubs asynchronous client producer
+│   ├── data.py                    # Synthetic ride telemetry and JSON payload generator
+│   └── app_design/                # HTML/CSS UI templates for ride booking
+├── Databricks/
+│   └── uber_rides_ingest/
+│       ├── transformations/
+│       │   ├── bronze/
+│       │   │   ├── ingest.py      # Kafka streaming ingestion into bronze
+│       │   │   └── bronze_adls.ipynb # ADLS Gen2 batch ingestion
+│       │   ├── silver/
+│       │   │   ├── silver.py      # Unified staging append flow (bulk + stream)
+│       │   │   └── Silver_OBT.sql # Silver OBT with 3-minute watermark join
+│       │   └── gold/
+│       │       └── model.py       # Star Schema Fact & Dimensions via Auto-CDC
+│       ├── explorations/          # Prototyping and stream verification notebooks
+│       └── jinja_for_OBT.ipynb    # Jinja2 metadata-driven SQL generation engine
+├── Mapping_tables/                # Source lookup JSON files (cities, makes, types, bulk)
+├── Images/
+│   ├── architecture.png           # End-to-end cloud architecture diagram
+│   └── Pipeline_Graph.png         # Databricks Lakeflow execution DAG
+├── config/
+│   ├── files_array.json           # ADF parameterization configuration
+│   ├── requirements.txt           # Python library dependencies
+│   ├── pyproject.toml             # Project build configuration
+│   └── .python-version            # Python runtime version
+└── README.md
+```
+
+---
+
+## Local Setup & Quickstart
+
+### 1. Prerequisites
+* Azure Account (Event Hubs Standard namespace, Data Factory, ADLS Gen2).
+* Databricks Workspace (Serverless or Classic compute enabled with Unity Catalog).
+* Local Python 3.10+ runtime.
+
+### 2. Local App Simulation
+```bash
+# Clone the repository
+git clone [https://github.com/botchoridzetemuri/Uber-Data-Engineering-Project.git](https://github.com/botchoridzetemuri/Uber-Data-Engineering-Project.git)
+cd Uber-Data-Engineering-Project
+
+# Set up virtual environment
+python -m venv .venv
+source .venv/bin/activate    # On Windows: .venv\Scripts\Activate.ps1
+pip install -r config/requirements.txt
+
+# Run the FastAPI Booking Application
+uvicorn App.api:app --reload --port 8000
+```
+
+Open `http://localhost:8000` in your browser. Every time you click **"Book a Ride"**, a new transaction is generated and published to your Azure Event Hub topic in real time.
+
+---
+
+## Tech Stack Summary
+
+* **Event Broker:** Azure Event Hubs (Standard Tier, Kafka Protocol)
+* **Storage Layer:** Azure Data Lake Storage Gen2 (Hierarchical Namespace) & Delta Lake
+* **Orchestration:** Azure Data Factory (Dynamic Parameterized Pipelines) & Databricks Workflows
+* **Transformation & Processing:** Apache Spark 3.5+, PySpark Structured Streaming, Spark Declarative Pipelines (Lakeflow / DLT)
+* **Data Modeling & Governance:** Databricks Unity Catalog, Jinja2 Templating, Auto-CDC (SCD 1 & 2)
+* **Producer Simulation:** Python, FastAPI, Uvicorn, Jinja2
+    ON stg_rides.pickup_city_id = map_cities.city_id 
+LEFT JOIN uber.bronze.map_vehicle_types 
+    ON stg_rides.vehicle_type_id = map_vehicle_types.vehicle_type_id
 
